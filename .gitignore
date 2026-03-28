@@ -5,9 +5,6 @@
 .beads-credential-key
 
 # Runtime data
-uploads/
-cards/
-test_grid.jpg
 __pycache__/
 *.pyc
 
