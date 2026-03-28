@@ -1,17 +1,22 @@
 """Card grid segmentation engine.
 
 Takes a photo of cards laid out in a grid and segments each individual card.
-Uses OpenCV contour detection to find rectangular card shapes.
+Uses contour detection to locate cards, then infers grid boundaries for
+clean, consistent cropping.
 """
 
 import cv2
 import numpy as np
 from pathlib import Path
-from PIL import Image
 
 
 def segment_cards(image_path: str, output_dir: str, min_card_area_ratio: float = 0.005) -> list[Path]:
     """Segment individual cards from a grid photo.
+
+    Strategy: use contour detection to find card centers, cluster them
+    into rows and columns, then crop using grid boundaries (midpoints
+    between adjacent rows/cols). This gives clean crops even when
+    contour shapes are irregular.
 
     Args:
         image_path: Path to the uploaded grid photo.
@@ -32,204 +37,162 @@ def segment_cards(image_path: str, output_dir: str, min_card_area_ratio: float =
     total_area = height * width
     min_card_area = total_area * min_card_area_ratio
 
-    # Preprocess: grayscale, blur
+    # --- Step 1: Find card regions via thresholding ---
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    # Cards on dark background: use Otsu threshold to separate bright cards from dark bg
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Open to remove noise, then erode to separate touching cards
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
 
-    # Erode to create clear gaps between adjacent cards
     kernel_erode = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     thresh = cv2.erode(thresh, kernel_erode, iterations=1)
 
-    # Find contours
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    card_rects = []
+    # --- Step 2: Extract card center points ---
+    card_centers = []
+    card_sizes = []
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < min_card_area:
             continue
-
-        # Approximate the contour to a polygon
-        peri = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-
-        # Get the bounding rect for cropping
         x, y, bw, bh = cv2.boundingRect(contour)
-
-        # Check aspect ratio using bounding rect — more stable than minAreaRect
-        # Cards are typically ~2.5x3.5 inches (ratio ~0.71)
         aspect = min(bw, bh) / max(bw, bh) if bw > 0 and bh > 0 else 0
-        if aspect < 0.45 or aspect > 0.95:
+        if aspect < 0.35 or aspect > 0.95:
             continue
+        cx = x + bw // 2
+        cy = y + bh // 2
+        card_centers.append((cx, cy))
+        card_sizes.append((bw, bh))
 
-        card_rects.append((x, y, bw, bh))
+    if not card_centers:
+        return []
 
-    # Merge overlapping/adjacent boxes that are fragments of the same card.
-    # This handles cards with strong internal design lines (e.g. Score 2007)
-    # that get split into top/bottom halves by contour detection.
-    if len(card_rects) >= 2:
-        card_rects = _merge_overlapping_rects(card_rects)
-
-    # Filter out outlier-small detections (e.g. shadows) — must be at least
-    # 25% of the median card area to be considered a real card
-    if len(card_rects) >= 3:
-        areas = [w * h for (_, _, w, h) in card_rects]
+    # Filter outlier-small detections
+    if len(card_sizes) >= 3:
+        areas = [w * h for w, h in card_sizes]
         median_area = float(np.median(areas))
-        card_rects = [(x, y, w, h) for (x, y, w, h) in card_rects
-                      if w * h >= median_area * 0.25]
+        filtered = [(c, s) for c, s in zip(card_centers, card_sizes)
+                     if s[0] * s[1] >= median_area * 0.25]
+        card_centers = [c for c, _ in filtered]
+        card_sizes = [s for _, s in filtered]
 
-    # Sort cards: top-to-bottom, then left-to-right
-    if card_rects:
-        card_rects = _sort_grid(card_rects)
+    if not card_centers:
+        return []
 
-    # Infer grid and fill missing cells for dark-bordered cards that
-    # blend into the background and aren't picked up by thresholding
-    if len(card_rects) >= 3:
-        card_rects = _fill_missing_grid_cells(card_rects, width, height)
+    # Use median size (robust to fragments that drag down the mean)
+    avg_w = int(np.median([s[0] for s in card_sizes]))
+    avg_h = int(np.median([s[1] for s in card_sizes]))
 
-    # Crop and save each card
-    saved_paths = []
-    for i, (x, y, w, h) in enumerate(card_rects):
-        # Add small padding
-        pad = 5
-        x1 = max(0, x - pad)
-        y1 = max(0, y - pad)
-        x2 = min(width, x + w + pad)
-        y2 = min(height, y + h + pad)
+    # For clustering, use the larger dimension as the card "height"
+    # to handle both portrait and landscape cards
+    cluster_size = max(avg_w, avg_h)
 
-        card_img = img[y1:y2, x1:x2]
-        card_path = output_path / f"card_{i:03d}.jpg"
-        cv2.imwrite(str(card_path), card_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
-        saved_paths.append(card_path)
+    # --- Step 3: Cluster centers into rows and columns ---
+    ys = sorted([c[1] for c in card_centers])
+    xs = sorted([c[0] for c in card_centers])
 
-    return saved_paths
-
-
-def _merge_overlapping_rects(rects: list[tuple]) -> list[tuple]:
-    """Merge bounding boxes that are fragments of the same card.
-
-    When a card's internal design creates multiple contours, we get
-    two (or more) boxes for one card. Only merge when:
-    - Boxes have significant horizontal overlap (>50%)
-    - Boxes are very close vertically (gap < 8% of combined height)
-    - At least one box looks like a fragment (aspect ratio outside
-      normal card range 0.60-0.85), suggesting it's a half-card
-    """
-    if len(rects) < 2:
-        return rects
-
-    merged = list(rects)
-    changed = True
-    while changed:
-        changed = False
-        new_merged = []
-        used = set()
-        for i in range(len(merged)):
-            if i in used:
-                continue
-            x1, y1, w1, h1 = merged[i]
-            r1_left, r1_right = x1, x1 + w1
-            r1_top, r1_bottom = y1, y1 + h1
-            for j in range(i + 1, len(merged)):
-                if j in used:
-                    continue
-                x2, y2, w2, h2 = merged[j]
-                r2_left, r2_right = x2, x2 + w2
-                r2_top, r2_bottom = y2, y2 + h2
-
-                # At least one box must look like a fragment (not a full card)
-                a1 = min(w1, h1) / max(w1, h1) if w1 > 0 and h1 > 0 else 0
-                a2 = min(w2, h2) / max(w2, h2) if w2 > 0 and h2 > 0 else 0
-                either_is_fragment = a1 > 0.85 or a2 > 0.85 or a1 < 0.55 or a2 < 0.55
-                if not either_is_fragment:
-                    continue
-
-                # Check horizontal overlap
-                overlap_x = max(0, min(r1_right, r2_right) - max(r1_left, r2_left))
-                min_width = min(w1, w2)
-                if min_width == 0 or overlap_x < min_width * 0.5:
-                    continue
-
-                # Vertical gap must be very small
-                gap_y = max(0, max(r1_top, r2_top) - min(r1_bottom, r2_bottom))
-                combined_h = max(r1_bottom, r2_bottom) - min(r1_top, r2_top)
-                if combined_h == 0 or gap_y > combined_h * 0.08:
-                    continue
-
-                # Merge: union of the two boxes
-                nx = min(r1_left, r2_left)
-                ny = min(r1_top, r2_top)
-                nr = max(r1_right, r2_right)
-                nb = max(r1_bottom, r2_bottom)
-                x1, y1, w1, h1 = nx, ny, nr - nx, nb - ny
-                r1_left, r1_right = nx, nr
-                r1_top, r1_bottom = ny, nb
-                used.add(j)
-                changed = True
-
-            new_merged.append((x1, y1, w1, h1))
-        merged = new_merged
-
-    return merged
-
-
-def _fill_missing_grid_cells(
-    card_rects: list[tuple], img_width: int, img_height: int
-) -> list[tuple]:
-    """Infer grid layout from detected cards and fill gaps.
-
-    Dark-bordered cards can blend into dark backgrounds, causing contour
-    detection to miss them. This uses the detected cards to figure out
-    the grid dimensions (rows/cols) and synthesizes bounding boxes for
-    any empty cells.
-    """
-    if len(card_rects) < 3:
-        return card_rects
-
-    # Cluster card centers into rows and columns
-    centers_y = sorted(set(r[1] + r[3] // 2 for r in card_rects))
-    centers_x = sorted(set(r[0] + r[2] // 2 for r in card_rects))
-
-    avg_h = int(np.mean([r[3] for r in card_rects]))
-    avg_w = int(np.mean([r[2] for r in card_rects]))
-
-    # Cluster y-centers into rows
-    row_centers = _cluster_1d(centers_y, avg_h * 0.5)
-    col_centers = _cluster_1d(centers_x, avg_w * 0.5)
+    row_centers = _cluster_1d(ys, cluster_size * 0.5)
+    col_centers = _cluster_1d(xs, cluster_size * 0.5)
 
     n_rows = len(row_centers)
     n_cols = len(col_centers)
 
-    if n_rows < 2 or n_cols < 2:
-        return card_rects
+    if n_rows < 1 or n_cols < 1:
+        return []
 
-    # Check each grid cell for a detected card
-    occupied = set()
-    for r in card_rects:
-        cx, cy = r[0] + r[2] // 2, r[1] + r[3] // 2
-        ri = _nearest_idx(row_centers, cy)
-        ci = _nearest_idx(col_centers, cx)
-        occupied.add((ri, ci))
+    # --- Step 4: Compute grid boundaries (midpoints between adjacent rows/cols) ---
+    row_bounds = _compute_boundaries(row_centers, avg_h, 0, height)
+    col_bounds = _compute_boundaries(col_centers, avg_w, 0, width)
 
-    # Fill missing cells
-    filled = list(card_rects)
-    for ri, ry in enumerate(row_centers):
-        for ci, cx in enumerate(col_centers):
-            if (ri, ci) not in occupied:
-                x = int(cx - avg_w // 2)
-                y = int(ry - avg_h // 2)
-                x = max(0, min(x, img_width - avg_w))
-                y = max(0, min(y, img_height - avg_h))
-                filled.append((x, y, avg_w, avg_h))
+    # --- Step 5: Crop each cell, adding padding to tighten around the card ---
+    saved_paths = []
+    idx = 0
+    for ri in range(n_rows):
+        for ci in range(n_cols):
+            y1 = row_bounds[ri]
+            y2 = row_bounds[ri + 1]
+            x1 = col_bounds[ci]
+            x2 = col_bounds[ci + 1]
 
-    return _sort_grid(filled)
+            # Tighten crop: find the bright region within this cell
+            cell_thresh = thresh[y1:y2, x1:x2]
+            tight = _tighten_crop(cell_thresh, x1, y1, x2, y2, margin=8)
+            if tight:
+                x1, y1, x2, y2 = tight
+
+            card_img = img[y1:y2, x1:x2]
+            card_path = output_path / f"card_{idx:03d}.jpg"
+            cv2.imwrite(str(card_path), card_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            saved_paths.append(card_path)
+            idx += 1
+
+    return saved_paths
+
+
+def _compute_boundaries(centers: list[float], avg_size: int,
+                        img_min: int, img_max: int) -> list[int]:
+    """Compute grid cell boundaries from cluster centers.
+
+    Boundaries are midpoints between adjacent centers, with the first
+    and last boundaries extending to the image edges (clamped).
+    """
+    centers = sorted(centers)
+    bounds = []
+
+    # First boundary: half a card-width before the first center
+    first = max(img_min, int(centers[0] - avg_size * 0.6))
+    bounds.append(first)
+
+    # Interior boundaries: midpoints between adjacent centers
+    for i in range(len(centers) - 1):
+        mid = int((centers[i] + centers[i + 1]) / 2)
+        bounds.append(mid)
+
+    # Last boundary: half a card-width after the last center
+    last = min(img_max, int(centers[-1] + avg_size * 0.6))
+    bounds.append(last)
+
+    return bounds
+
+
+def _tighten_crop(cell_thresh: np.ndarray, x1: int, y1: int,
+                  x2: int, y2: int, margin: int = 8) -> tuple | None:
+    """Tighten a grid cell crop to the actual card within it.
+
+    Finds the bounding box of bright pixels in the thresholded cell
+    and returns tightened coordinates with a small margin.
+    """
+    if cell_thresh.size == 0:
+        return None
+
+    # Find rows and cols with bright pixels
+    row_sums = np.sum(cell_thresh, axis=1)
+    col_sums = np.sum(cell_thresh, axis=0)
+
+    bright_rows = np.where(row_sums > 0)[0]
+    bright_cols = np.where(col_sums > 0)[0]
+
+    if len(bright_rows) == 0 or len(bright_cols) == 0:
+        return None
+
+    # Only tighten if we'd remove significant background
+    cell_h = y2 - y1
+    cell_w = x2 - x1
+    card_h = bright_rows[-1] - bright_rows[0]
+    card_w = bright_cols[-1] - bright_cols[0]
+
+    # Don't tighten if the card fills most of the cell already
+    if card_h > cell_h * 0.9 and card_w > cell_w * 0.9:
+        return None
+
+    ty1 = max(y1, y1 + int(bright_rows[0]) - margin)
+    ty2 = min(y2, y1 + int(bright_rows[-1]) + margin)
+    tx1 = max(x1, x1 + int(bright_cols[0]) - margin)
+    tx2 = min(x2, x1 + int(bright_cols[-1]) + margin)
+
+    return (tx1, ty1, tx2, ty2)
 
 
 def _cluster_1d(values: list[float], min_gap: float) -> list[float]:
@@ -242,41 +205,7 @@ def _cluster_1d(values: list[float], min_gap: float) -> list[float]:
             clusters[-1].append(v)
         else:
             clusters.append([v])
-    return [np.mean(c) for c in clusters]
-
-
-def _nearest_idx(centers: list[float], value: float) -> int:
-    """Return index of the nearest center."""
-    return int(np.argmin([abs(c - value) for c in centers]))
-
-
-def _sort_grid(rects: list[tuple]) -> list[tuple]:
-    """Sort rectangles in reading order (top-to-bottom, left-to-right).
-
-    Groups cards into rows based on y-coordinate proximity,
-    then sorts each row by x-coordinate.
-    """
-    if not rects:
-        return rects
-
-    # Sort by y first
-    rects.sort(key=lambda r: r[1])
-
-    # Group into rows: cards within similar y-range are same row
-    rows = []
-    current_row = [rects[0]]
-    avg_height = np.mean([r[3] for r in rects])
-
-    for rect in rects[1:]:
-        if abs(rect[1] - current_row[0][1]) < avg_height * 0.5:
-            current_row.append(rect)
-        else:
-            rows.append(sorted(current_row, key=lambda r: r[0]))
-            current_row = [rect]
-    rows.append(sorted(current_row, key=lambda r: r[0]))
-
-    # Flatten back
-    return [rect for row in rows for rect in row]
+    return [float(np.mean(c)) for c in clusters]
 
 
 def segment_grid_uniform(image_path: str, output_dir: str, rows: int, cols: int) -> list[Path]:
@@ -284,15 +213,6 @@ def segment_grid_uniform(image_path: str, output_dir: str, rows: int, cols: int)
 
     Fallback when contour detection doesn't work well —
     just divide the image into equal cells.
-
-    Args:
-        image_path: Path to the uploaded grid photo.
-        output_dir: Directory to save cropped card images.
-        rows: Number of rows in the grid.
-        cols: Number of columns in the grid.
-
-    Returns:
-        List of paths to cropped card images.
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -305,7 +225,6 @@ def segment_grid_uniform(image_path: str, output_dir: str, rows: int, cols: int)
     cell_h = height // rows
     cell_w = width // cols
 
-    # Trim margins (10% of cell size)
     margin_h = int(cell_h * 0.05)
     margin_w = int(cell_w * 0.05)
 
