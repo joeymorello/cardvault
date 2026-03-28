@@ -97,32 +97,33 @@ def insert_card(batch_id: int, image_path: str, grid_position: int) -> int:
 
 def update_card_identification(card_id: int, data: dict):
     conn = get_db()
-    conn.execute(
-        """UPDATE cards SET
-            player_name = ?, year = ?, card_set = ?, card_number = ?,
-            manufacturer = ?, sport = ?, condition = ?, condition_notes = ?,
-            rarity = ?, estimated_price_low = ?, estimated_price_high = ?,
-            ai_confidence = ?, raw_ai_response = ?,
-            status = 'identified', updated_at = datetime('now'),
-            last_price_update = datetime('now')
-        WHERE id = ?""",
-        (
-            data.get("player_name"),
-            data.get("year"),
-            data.get("card_set"),
-            data.get("card_number"),
-            data.get("manufacturer"),
-            data.get("sport"),
-            data.get("condition"),
-            data.get("condition_notes"),
-            data.get("rarity"),
-            data.get("estimated_price_low"),
-            data.get("estimated_price_high"),
-            data.get("ai_confidence"),
-            json.dumps(data) if data else None,
-            card_id,
-        ),
-    )
+    # Only update fields that are present in data — preserve existing values
+    updatable = [
+        "player_name", "year", "card_set", "card_number",
+        "manufacturer", "sport", "condition", "condition_notes",
+        "rarity", "estimated_price_low", "estimated_price_high",
+        "ai_confidence",
+    ]
+    set_clauses = []
+    values = []
+    for field in updatable:
+        if field in data:
+            set_clauses.append(f"{field} = ?")
+            values.append(data[field])
+
+    if not set_clauses:
+        conn.close()
+        return
+
+    set_clauses.append("status = 'identified'")
+    set_clauses.append("updated_at = datetime('now')")
+    set_clauses.append("last_price_update = datetime('now')")
+    set_clauses.append("raw_ai_response = ?")
+    values.append(json.dumps(data) if data else None)
+
+    values.append(card_id)
+    sql = f"UPDATE cards SET {', '.join(set_clauses)} WHERE id = ?"
+    conn.execute(sql, values)
     conn.commit()
     conn.close()
 
