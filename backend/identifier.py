@@ -1,110 +1,133 @@
-"""Card identification agent.
+"""Card identification via OCR text extraction.
 
-Uses Claude's vision API to identify sports cards from images.
-Falls back to manual identification if no API key is available.
+Uses Tesseract OCR to pull visible text from card images,
+then structures the extracted text into candidate fields.
 """
 
-import base64
 import json
-import os
-import subprocess
+import re
+import pytesseract
+import cv2
 from pathlib import Path
 
 
-def identify_card_with_claude(image_path: str) -> dict:
-    """Use Claude CLI to identify a card from its image.
+def extract_card_text(image_path: str) -> dict:
+    """Run OCR on a card image and attempt to parse structured fields.
 
-    Sends the card image to Claude with a structured prompt
-    to extract card details and estimate value.
+    Returns a dict with extracted text and any fields we can auto-detect.
     """
-    image_path = Path(image_path)
+    image_path = Path(image_path).resolve()
     if not image_path.exists():
         return {"error": f"Image not found: {image_path}"}
 
-    prompt = """You are a vintage sports card expert appraiser. Analyze this card image and provide:
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return {"error": f"Could not read image: {image_path}"}
 
-1. **Player Name** — full name of the player
-2. **Year** — year the card was produced
-3. **Card Set** — the set/series name (e.g., "Topps", "Bowman", "Fleer", "Upper Deck")
-4. **Card Number** — the card number if visible
-5. **Manufacturer** — card manufacturer
-6. **Sport** — baseball, basketball, football, hockey, etc.
-7. **Condition** — estimate: Mint, Near Mint, Excellent, Very Good, Good, Fair, Poor
-8. **Condition Notes** — any visible damage, wear, centering issues
-9. **Rarity** — Common, Uncommon, Rare, Very Rare, Ultra Rare
-10. **Estimated Price Low** — conservative estimate in USD
-11. **Estimated Price High** — optimistic estimate in USD
-12. **Confidence** — your confidence level 0.0 to 1.0
+    # Preprocess for better OCR
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Sharpen
+    gray = cv2.GaussianBlur(gray, (1, 1), 0)
+    # Increase contrast
+    gray = cv2.convertScaleAbs(gray, alpha=1.5, beta=20)
 
-Respond ONLY with valid JSON (no markdown, no explanation):
-{
-    "player_name": "...",
-    "year": 1952,
-    "card_set": "...",
-    "card_number": "...",
-    "manufacturer": "...",
-    "sport": "...",
-    "condition": "...",
-    "condition_notes": "...",
-    "rarity": "...",
-    "estimated_price_low": 0.00,
-    "estimated_price_high": 0.00,
-    "ai_confidence": 0.0
-}"""
+    # Run OCR
+    raw_text = pytesseract.image_to_string(gray, config="--psm 6")
+    raw_text_block = pytesseract.image_to_string(gray, config="--psm 3")
 
-    try:
-        # Use Claude CLI with image input
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--output-format", "json", str(image_path)],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+    # Combine both passes for best coverage
+    all_text = f"{raw_text}\n{raw_text_block}"
+    lines = [l.strip() for l in all_text.splitlines() if l.strip()]
+    unique_lines = list(dict.fromkeys(lines))  # dedupe preserving order
 
-        if result.returncode != 0:
-            return {"error": f"Claude CLI failed: {result.stderr}"}
+    # Try to auto-detect fields from OCR text
+    result = {
+        "raw_ocr_text": "\n".join(unique_lines),
+        "player_name": _guess_player_name(unique_lines),
+        "year": _guess_year(all_text),
+        "card_number": _guess_card_number(all_text),
+        "manufacturer": _guess_manufacturer(all_text),
+        "sport": None,
+        "card_set": None,
+        "condition": None,
+        "condition_notes": None,
+        "rarity": None,
+        "estimated_price_low": None,
+        "estimated_price_high": None,
+        "ai_confidence": None,
+    }
 
-        # Parse the response — Claude returns JSON with a "result" field
-        response = json.loads(result.stdout)
-        text = response.get("result", result.stdout)
-
-        # Extract JSON from the response text
-        card_data = _extract_json(text)
-        if card_data:
-            return card_data
-
-        return {"error": "Could not parse card data from response", "raw": text}
-
-    except subprocess.TimeoutExpired:
-        return {"error": "Claude CLI timed out"}
-    except (json.JSONDecodeError, KeyError) as e:
-        return {"error": f"Failed to parse response: {e}"}
+    return result
 
 
-def identify_cards_batch(image_paths: list[str]) -> list[dict]:
-    """Identify multiple cards sequentially."""
-    results = []
-    for path in image_paths:
-        result = identify_card_with_claude(path)
-        results.append(result)
-    return results
+def _guess_player_name(lines: list[str]) -> str | None:
+    """Guess player name — typically the most prominent text on the card.
+
+    Heuristic: look for lines that are mostly alphabetic, title-case,
+    and 2-4 words long (typical name format).
+    """
+    candidates = []
+    for line in lines:
+        # Skip very short or very long lines
+        if len(line) < 3 or len(line) > 40:
+            continue
+        # Skip lines that are mostly numbers
+        if sum(c.isdigit() for c in line) > len(line) * 0.4:
+            continue
+        # Skip known non-name patterns
+        lower = line.lower()
+        if any(kw in lower for kw in ["topps", "bowman", "fleer", "upper deck", "donruss",
+                                       "score", "copyright", "printed", "card", "no.", "#",
+                                       "www.", ".com", "tm", "®"]):
+            continue
+        words = line.split()
+        if 1 <= len(words) <= 4 and all(w[0].isupper() for w in words if w.isalpha()):
+            candidates.append(line)
+
+    return candidates[0] if candidates else None
 
 
-def _extract_json(text: str) -> dict | None:
-    """Extract JSON object from a string that may contain surrounding text."""
-    # Try direct parse first
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+def _guess_year(text: str) -> int | None:
+    """Look for a 4-digit year between 1900-2030."""
+    years = re.findall(r'\b(19[0-9]{2}|20[0-2][0-9])\b', text)
+    if years:
+        # Return the earliest year found (most likely production year)
+        return min(int(y) for y in years)
+    return None
 
-    # Find JSON block in text
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    if start >= 0 and end > start:
-        try:
-            return json.loads(text[start:end])
-        except json.JSONDecodeError:
-            pass
 
+def _guess_card_number(text: str) -> str | None:
+    """Look for card number patterns like #123, No. 45, etc."""
+    patterns = [
+        r'#\s*(\d+)',
+        r'[Nn]o\.?\s*(\d+)',
+        r'\b(\d{1,4})\s*of\s*\d+',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _guess_manufacturer(text: str) -> str | None:
+    """Check for known card manufacturers in the text."""
+    manufacturers = {
+        "topps": "Topps",
+        "bowman": "Bowman",
+        "fleer": "Fleer",
+        "upper deck": "Upper Deck",
+        "donruss": "Donruss",
+        "score": "Score",
+        "pinnacle": "Pinnacle",
+        "pacific": "Pacific",
+        "skybox": "SkyBox",
+        "hoops": "Hoops",
+        "panini": "Panini",
+        "leaf": "Leaf",
+    }
+    lower = text.lower()
+    for key, name in manufacturers.items():
+        if key in lower:
+            return name
     return None

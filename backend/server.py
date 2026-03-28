@@ -10,10 +10,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
+from pydantic import BaseModel
+
 from database import init_db, insert_batch, insert_card, update_card_identification
 from database import get_cards, get_card, get_batches, get_stats
 from segmenter import segment_cards, segment_grid_uniform
-from identifier import identify_card_with_claude
+from identifier import extract_card_text
+
+
+class CardUpdate(BaseModel):
+    player_name: Optional[str] = None
+    year: Optional[int] = None
+    card_set: Optional[str] = None
+    card_number: Optional[str] = None
+    manufacturer: Optional[str] = None
+    sport: Optional[str] = None
+    condition: Optional[str] = None
+    condition_notes: Optional[str] = None
+    rarity: Optional[str] = None
+    estimated_price_low: Optional[float] = None
+    estimated_price_high: Optional[float] = None
 
 BASE_DIR = Path(__file__).parent.parent
 UPLOADS_DIR = BASE_DIR / "uploads"
@@ -152,9 +168,9 @@ async def api_upload(
     }
 
 
-@app.post("/api/cards/{card_id}/identify")
-def api_identify_card(card_id: int):
-    """Run AI identification on a single card."""
+@app.post("/api/cards/{card_id}/ocr")
+def api_ocr_card(card_id: int):
+    """Run OCR text extraction on a single card."""
     card = get_card(card_id)
     if not card:
         raise HTTPException(status_code=404, detail="Card not found")
@@ -163,24 +179,37 @@ def api_identify_card(card_id: int):
     if not image_path.exists():
         raise HTTPException(status_code=404, detail="Card image not found")
 
-    result = identify_card_with_claude(str(image_path))
+    result = extract_card_text(str(image_path))
     if "error" in result:
         raise HTTPException(status_code=500, detail=result["error"])
 
-    update_card_identification(card_id, result)
+    return result
+
+
+@app.put("/api/cards/{card_id}")
+def api_update_card(card_id: int, data: CardUpdate):
+    """Manually update card identification fields."""
+    card = get_card(card_id)
+    if not card:
+        raise HTTPException(status_code=404, detail="Card not found")
+
+    update_data = {k: v for k, v in data.model_dump().items() if v is not None}
+    if update_data:
+        update_card_identification(card_id, update_data)
+
     return get_card(card_id)
 
 
-@app.post("/api/batches/{batch_id}/identify")
-def api_identify_batch(batch_id: int):
-    """Run AI identification on all pending cards in a batch."""
+@app.post("/api/batches/{batch_id}/ocr")
+def api_ocr_batch(batch_id: int):
+    """Run OCR on all pending cards in a batch."""
     cards, _ = get_cards({"status": "pending"}, limit=200)
     batch_cards = [c for c in cards if c["batch_id"] == batch_id]
 
     if not batch_cards:
-        return {"message": "No pending cards in this batch", "identified": 0}
+        return {"message": "No pending cards in this batch", "processed": 0}
 
-    identified = 0
+    processed = 0
     errors = []
     for card in batch_cards:
         image_path = CARDS_DIR / card["image_path"]
@@ -188,15 +217,18 @@ def api_identify_batch(batch_id: int):
             errors.append({"card_id": card["id"], "error": "Image not found"})
             continue
 
-        result = identify_card_with_claude(str(image_path))
+        result = extract_card_text(str(image_path))
         if "error" in result:
             errors.append({"card_id": card["id"], "error": result["error"]})
             continue
 
-        update_card_identification(card["id"], result)
-        identified += 1
+        # Only update fields that OCR actually found
+        update_data = {k: v for k, v in result.items() if v is not None and k != "raw_ocr_text"}
+        if update_data:
+            update_card_identification(card["id"], update_data)
+        processed += 1
 
-    return {"identified": identified, "errors": errors, "total": len(batch_cards)}
+    return {"processed": processed, "errors": errors, "total": len(batch_cards)}
 
 
 # Serve frontend

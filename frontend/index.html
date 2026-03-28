@@ -318,6 +318,22 @@
             to { transform: translateX(0); opacity: 1; }
         }
 
+        #editMode input, #editMode select {
+            width: 100%;
+            background: var(--bg);
+            color: var(--text);
+            border: 1px solid var(--border);
+            padding: 0.4rem 0.6rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            margin-top: 2px;
+        }
+
+        #editMode input:focus, #editMode select:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
         .pagination {
             display: flex;
             justify-content: center;
@@ -409,10 +425,60 @@
     <div class="modal-overlay" id="modalOverlay" onclick="closeModal()">
         <div class="modal" onclick="event.stopPropagation()">
             <img id="modalImg" src="">
-            <h2 id="modalTitle">Card Details</h2>
-            <div class="modal-details" id="modalDetails"></div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
+                <h2 id="modalTitle" style="margin:0">Card Details</h2>
+                <div style="display:flex;gap:0.5rem">
+                    <button id="viewModeBtn" class="secondary" onclick="toggleEditMode(false)" style="display:none">View</button>
+                    <button id="editModeBtn" onclick="toggleEditMode(true)">Edit</button>
+                </div>
+            </div>
+
+            <!-- View mode -->
+            <div id="viewMode">
+                <div class="modal-details" id="modalDetails"></div>
+                <div id="ocrTextBox" style="display:none;margin-top:1rem;padding:0.8rem;background:var(--bg);border-radius:8px;font-size:0.8rem;white-space:pre-wrap;color:var(--text-dim)"></div>
+            </div>
+
+            <!-- Edit mode -->
+            <div id="editMode" style="display:none">
+                <div class="modal-details">
+                    <div class="field"><div class="field-label">Player Name</div><input id="ed_player_name" placeholder="Player name"></div>
+                    <div class="field"><div class="field-label">Year</div><input id="ed_year" type="number" placeholder="e.g. 1989"></div>
+                    <div class="field"><div class="field-label">Card Set</div><input id="ed_card_set" placeholder="e.g. Topps"></div>
+                    <div class="field"><div class="field-label">Card Number</div><input id="ed_card_number" placeholder="e.g. 123"></div>
+                    <div class="field"><div class="field-label">Manufacturer</div><input id="ed_manufacturer" placeholder="e.g. Topps"></div>
+                    <div class="field"><div class="field-label">Sport</div>
+                        <select id="ed_sport">
+                            <option value="">--</option>
+                            <option value="baseball">Baseball</option>
+                            <option value="basketball">Basketball</option>
+                            <option value="football">Football</option>
+                            <option value="hockey">Hockey</option>
+                        </select>
+                    </div>
+                    <div class="field"><div class="field-label">Condition</div>
+                        <select id="ed_condition">
+                            <option value="">--</option>
+                            <option>Mint</option><option>Near Mint</option><option>Excellent</option>
+                            <option>Very Good</option><option>Good</option><option>Fair</option><option>Poor</option>
+                        </select>
+                    </div>
+                    <div class="field"><div class="field-label">Condition Notes</div><input id="ed_condition_notes" placeholder="Damage, centering..."></div>
+                    <div class="field"><div class="field-label">Rarity</div>
+                        <select id="ed_rarity">
+                            <option value="">--</option>
+                            <option>Common</option><option>Uncommon</option><option>Rare</option>
+                            <option>Very Rare</option><option>Ultra Rare</option>
+                        </select>
+                    </div>
+                    <div class="field"><div class="field-label">Price Low ($)</div><input id="ed_estimated_price_low" type="number" step="0.01" placeholder="0.00"></div>
+                    <div class="field"><div class="field-label">Price High ($)</div><input id="ed_estimated_price_high" type="number" step="0.01" placeholder="0.00"></div>
+                </div>
+            </div>
+
             <div class="modal-actions">
-                <button onclick="identifyCard()" id="modalIdentifyBtn">Identify with AI</button>
+                <button onclick="runOcr()" id="ocrBtn">OCR Scan</button>
+                <button onclick="saveCard()" id="saveBtn" class="success" style="display:none">Save</button>
                 <button class="secondary" onclick="closeModal()">Close</button>
             </div>
         </div>
@@ -585,15 +651,18 @@ uploadBtn.addEventListener('click', async (e) => {
 });
 
 // Modal
+let currentCard = null;
+
 async function openCard(id) {
     selectedCardId = id;
+    toggleEditMode(false);
     try {
         const res = await fetch(`${API}/api/cards/${id}`);
-        const c = await res.json();
+        currentCard = await res.json();
+        const c = currentCard;
 
         document.getElementById('modalImg').src = `/images/cards/${c.image_path}`;
         document.getElementById('modalTitle').textContent = c.player_name || 'Unidentified Card';
-        document.getElementById('modalIdentifyBtn').style.display = c.status === 'pending' ? '' : 'none';
 
         const fields = [
             ['Year', c.year],
@@ -605,7 +674,6 @@ async function openCard(id) {
             ['Condition Notes', c.condition_notes],
             ['Rarity', c.rarity],
             ['Price Range', c.estimated_price_high ? `$${c.estimated_price_low} - $${c.estimated_price_high}` : null],
-            ['AI Confidence', c.ai_confidence ? (c.ai_confidence * 100).toFixed(0) + '%' : null],
             ['Status', c.status],
             ['Batch', c.batch_id],
         ];
@@ -615,37 +683,106 @@ async function openCard(id) {
             .map(([label, val]) => `<div class="field"><div class="field-label">${label}</div><div>${val}</div></div>`)
             .join('');
 
+        // Hide OCR text by default
+        document.getElementById('ocrTextBox').style.display = 'none';
+
         document.getElementById('modalOverlay').classList.add('active');
     } catch (e) { console.error(e); }
+}
+
+function toggleEditMode(editing) {
+    document.getElementById('viewMode').style.display = editing ? 'none' : '';
+    document.getElementById('editMode').style.display = editing ? '' : 'none';
+    document.getElementById('editModeBtn').style.display = editing ? 'none' : '';
+    document.getElementById('viewModeBtn').style.display = editing ? '' : 'none';
+    document.getElementById('saveBtn').style.display = editing ? '' : 'none';
+
+    if (editing && currentCard) {
+        const c = currentCard;
+        document.getElementById('ed_player_name').value = c.player_name || '';
+        document.getElementById('ed_year').value = c.year || '';
+        document.getElementById('ed_card_set').value = c.card_set || '';
+        document.getElementById('ed_card_number').value = c.card_number || '';
+        document.getElementById('ed_manufacturer').value = c.manufacturer || '';
+        document.getElementById('ed_sport').value = c.sport || '';
+        document.getElementById('ed_condition').value = c.condition || '';
+        document.getElementById('ed_condition_notes').value = c.condition_notes || '';
+        document.getElementById('ed_rarity').value = c.rarity || '';
+        document.getElementById('ed_estimated_price_low').value = c.estimated_price_low || '';
+        document.getElementById('ed_estimated_price_high').value = c.estimated_price_high || '';
+    }
+}
+
+async function saveCard() {
+    if (!selectedCardId) return;
+    const data = {};
+    const fields = ['player_name','card_set','card_number','manufacturer','sport',
+                     'condition','condition_notes','rarity'];
+    fields.forEach(f => {
+        const v = document.getElementById('ed_' + f).value.trim();
+        if (v) data[f] = v;
+    });
+    const year = document.getElementById('ed_year').value;
+    if (year) data.year = parseInt(year);
+    const plo = document.getElementById('ed_estimated_price_low').value;
+    if (plo) data.estimated_price_low = parseFloat(plo);
+    const phi = document.getElementById('ed_estimated_price_high').value;
+    if (phi) data.estimated_price_high = parseFloat(phi);
+
+    try {
+        const res = await fetch(`${API}/api/cards/${selectedCardId}`, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(data),
+        });
+        if (!res.ok) throw new Error('Save failed');
+        toast('Card saved');
+        toggleEditMode(false);
+        openCard(selectedCardId);
+        loadCards();
+        loadStats();
+    } catch (e) { toast('Error: ' + e.message); }
+}
+
+async function runOcr() {
+    if (!selectedCardId) return;
+    const btn = document.getElementById('ocrBtn');
+    btn.disabled = true;
+    btn.textContent = 'Scanning...';
+
+    try {
+        const res = await fetch(`${API}/api/cards/${selectedCardId}/ocr`, { method: 'POST' });
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail || 'OCR failed');
+        }
+        const data = await res.json();
+
+        // Show raw OCR text
+        const ocrBox = document.getElementById('ocrTextBox');
+        ocrBox.textContent = 'OCR Text:\n' + (data.raw_ocr_text || '(none)');
+        ocrBox.style.display = 'block';
+
+        // Switch to edit mode and pre-fill with OCR results
+        toggleEditMode(true);
+        if (data.player_name) document.getElementById('ed_player_name').value = data.player_name;
+        if (data.year) document.getElementById('ed_year').value = data.year;
+        if (data.card_number) document.getElementById('ed_card_number').value = data.card_number;
+        if (data.manufacturer) document.getElementById('ed_manufacturer').value = data.manufacturer;
+
+        toast('OCR complete — review and edit fields');
+    } catch (e) {
+        toast('Error: ' + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'OCR Scan';
+    }
 }
 
 function closeModal() {
     document.getElementById('modalOverlay').classList.remove('active');
     selectedCardId = null;
-}
-
-async function identifyCard() {
-    if (!selectedCardId) return;
-    const btn = document.getElementById('modalIdentifyBtn');
-    btn.disabled = true;
-    btn.textContent = 'Identifying...';
-
-    try {
-        const res = await fetch(`${API}/api/cards/${selectedCardId}/identify`, { method: 'POST' });
-        if (!res.ok) {
-            const err = await res.json();
-            throw new Error(err.detail || 'Identification failed');
-        }
-        toast('Card identified successfully');
-        openCard(selectedCardId);
-        loadCards();
-        loadStats();
-    } catch (e) {
-        toast('Error: ' + e.message);
-    } finally {
-        btn.disabled = false;
-        btn.textContent = 'Identify with AI';
-    }
+    currentCard = null;
 }
 
 // Toast
